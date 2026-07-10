@@ -33,3 +33,5 @@ class MyHomePage extends StatelessWidget {
     );
   }
 }
+
+// Versao com branch protection ativa

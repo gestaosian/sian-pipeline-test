@@ -1,0 +1,158 @@
+name: Validate PR
+
+on:
+  pull_request:
+    branches:
+      - flutter-homolog
+      - flutter-main
+
+jobs:
+  # ─────────────────────────────────────────────
+  # JOB 1: Build e Testes Flutter
+  # ─────────────────────────────────────────────
+  flutter-build-test:
+    name: Build & Testes
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.41.0'
+          channel: 'stable'
+          cache: true
+
+      - name: Instalar dependencias
+        run: flutter pub get
+
+      - name: Analisar codigo (lint)
+        run: flutter analyze --no-fatal-infos
+
+      - name: Rodar testes
+        run: flutter test --reporter=expanded
+
+      - name: Build web (valida compilacao)
+        run: flutter build web --release
+
+  # ─────────────────────────────────────────────
+  # JOB 2: Security Scan
+  # Roda somente apos o Job 1 passar
+  # ─────────────────────────────────────────────
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: flutter-build-test
+
+    permissions:
+      pull-requests: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ── Semgrep SAST ──────────────────────────
+      - name: Semgrep SAST
+        id: semgrep
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >-
+            p/default
+            p/secrets
+            p/security-audit
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+        continue-on-error: true
+
+      # ── Gitleaks CLI (sem licenca necessaria) ─
+      - name: Instalar Gitleaks
+        run: |
+          curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz \
+            | tar -xz -C /usr/local/bin gitleaks
+
+      - name: Gitleaks — detectar secrets
+        id: gitleaks
+        run: |
+          if gitleaks detect --source . --log-opts "origin/flutter-homolog..HEAD" \
+              --report-format json --report-path gitleaks-report.json --exit-code 1; then
+            echo "status=clean" >> $GITHUB_OUTPUT
+            echo "count=0" >> $GITHUB_OUTPUT
+          else
+            COUNT=$(python3 -c "import json; d=json.load(open('gitleaks-report.json')); print(len(d) if isinstance(d,list) else 0)" 2>/dev/null || echo "?")
+            echo "status=found" >> $GITHUB_OUTPUT
+            echo "count=$COUNT" >> $GITHUB_OUTPUT
+          fi
+        continue-on-error: true
+
+      # ── Comentario de resumo no PR ────────────
+      - name: Comentar resultado no PR
+        uses: actions/github-script@v7
+        if: always()
+        env:
+          SEMGREP_OUTCOME: ${{ steps.semgrep.outcome }}
+          GITLEAKS_STATUS: ${{ steps.gitleaks.outputs.status }}
+          GITLEAKS_COUNT: ${{ steps.gitleaks.outputs.count }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const semgrepOk  = process.env.SEMGREP_OUTCOME === 'success';
+            const gitleaksOk = process.env.GITLEAKS_STATUS === 'clean';
+            const glCount    = process.env.GITLEAKS_COUNT || '0';
+
+            const ok  = (v) => v ? 'LIMPO' : 'ALERTAS ENCONTRADOS';
+            const ico = (v) => v ? 'OK' : 'ATENCAO';
+
+            const gitleaksCell = gitleaksOk
+              ? 'LIMPO'
+              : 'ALERTAS ENCONTRADOS — ' + glCount + ' secret(s) detectado(s)';
+
+            const lines = [
+              '## Security Scan — Resultado (Dry Run)',
+              '',
+              '> **Modo dry-run ativo:** findings nao bloqueiam o merge nesta fase de testes.',
+              '',
+              '| Scanner | Status | Resultado |',
+              '|---------|--------|-----------|',
+              '| Semgrep SAST | ' + (semgrepOk ? 'OK' : 'ATENCAO') + ' | ' + ok(semgrepOk) + ' |',
+              '| Gitleaks (secrets) | ' + (gitleaksOk ? 'OK' : 'ATENCAO') + ' | ' + gitleaksCell + ' |',
+              '',
+              (semgrepOk && gitleaksOk)
+                ? 'Codigo limpo — nenhuma vulnerabilidade encontrada.'
+                : 'ATENCAO: Verifique os logs do workflow para detalhes dos alertas.',
+              '',
+              'Executado em: ' + new Date().toLocaleString('pt-BR', {timeZone: 'America/Sao_Paulo'})
+            ];
+
+            const body = lines.join('\n');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find(c =>
+              c.user.login === 'github-actions[bot]' &&
+              c.body.includes('Security Scan')
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
