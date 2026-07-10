@@ -1,0 +1,137 @@
+name: Validate PR
+
+on:
+  pull_request:
+    branches:
+      - flutter-homolog
+      - flutter-main
+
+jobs:
+  # ─────────────────────────────────────────────
+  # JOB 1: Build e Testes Flutter
+  # ─────────────────────────────────────────────
+  flutter-build-test:
+    name: Build & Testes
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.41.0'
+          channel: 'stable'
+          cache: true
+
+      - name: Instalar dependencias
+        run: flutter pub get
+
+      - name: Analisar codigo (lint)
+        run: flutter analyze --no-fatal-infos
+
+      - name: Rodar testes
+        run: flutter test --reporter=expanded
+
+      - name: Build web (valida compilacao)
+        run: flutter build web --release
+
+  # ─────────────────────────────────────────────
+  # JOB 2: Security Scan
+  # Roda somente apos o Job 1 passar
+  # ─────────────────────────────────────────────
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: flutter-build-test
+
+    permissions:
+      pull-requests: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ── Semgrep SAST ──────────────────────────
+      - name: Semgrep SAST
+        id: semgrep
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >-
+            p/default
+            p/secrets
+            p/security-audit
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+        continue-on-error: true  # dry-run: nao bloqueia
+
+      # ── Gitleaks — secrets expostos ──────────
+      - name: Gitleaks
+        id: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+        continue-on-error: true  # dry-run: nao bloqueia
+
+      # ── Comentario de resumo no PR ────────────
+      - name: Comentar resultado no PR
+        uses: actions/github-script@v7
+        if: always()
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const semgrepOk  = '${{ steps.semgrep.outcome }}'  === 'success';
+            const gitleaksOk = '${{ steps.gitleaks.outcome }}' === 'success';
+
+            const icon  = (ok) => ok ? '✅' : '⚠️';
+            const badge = (ok) => ok ? '`LIMPO`' : '`ALERTAS ENCONTRADOS`';
+
+            const body = [
+              '## 🔒 Security Scan — Resultado (Dry Run)',
+              '',
+              '> **Modo dry-run ativo:** findings nao bloqueiam o merge nesta fase de testes.',
+              '',
+              '| Scanner | Status | Resultado |',
+              '|---------|--------|-----------|',
+              `| Semgrep SAST | ${icon(semgrepOk)} | ${badge(semgrepOk)} |`,
+              `| Gitleaks (secrets) | ${icon(gitleaksOk)} | ${badge(gitleaksOk)} |`,
+              '',
+              semgrepOk && gitleaksOk
+                ? '**Codigo limpo — nenhuma vulnerabilidade encontrada.** ✅'
+                : '**Verifique os logs do workflow para detalhes dos alertas.**',
+              '',
+              `*Executado em: ${new Date().toLocaleString('pt-BR', {timeZone: 'America/Sao_Paulo'})}*`
+            ].join('\n');
+
+            // Atualiza comentario existente ou cria novo
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find(c =>
+              c.user.login === 'github-actions[bot]' &&
+              c.body.includes('Security Scan')
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
