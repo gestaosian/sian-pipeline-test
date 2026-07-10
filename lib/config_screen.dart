@@ -8,11 +8,11 @@ class ConfigScreen extends StatelessWidget {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text('Configuracoes')),
-      body: Center(
+      body: const Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Text('App: ${AppConfig.appName}'),
+            Text('App: SIAN Pipeline Test'),
             Text('Versao: ${AppConfig.version}'),
           ],
         ),
