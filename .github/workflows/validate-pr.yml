@@ -78,54 +78,57 @@ jobs:
       - name: Gitleaks — detectar secrets
         id: gitleaks
         run: |
-          gitleaks detect \
-            --source . \
-            --log-opts "origin/flutter-homolog..HEAD" \
-            --report-format json \
-            --report-path gitleaks-report.json \
-            --exit-code 1 || echo "GITLEAKS_FOUND=true" >> $GITHUB_ENV
-        continue-on-error: true
-
-      - name: Contar findings Gitleaks
-        id: gitleaks_count
-        run: |
-          if [ -f gitleaks-report.json ]; then
-            COUNT=$(python3 -c "import json,sys; d=json.load(open('gitleaks-report.json')); print(len(d) if isinstance(d,list) else 0)" 2>/dev/null || echo "0")
+          if gitleaks detect --source . --log-opts "origin/flutter-homolog..HEAD" \
+              --report-format json --report-path gitleaks-report.json --exit-code 1; then
+            echo "status=clean" >> $GITHUB_OUTPUT
+            echo "count=0" >> $GITHUB_OUTPUT
           else
-            COUNT=0
+            COUNT=$(python3 -c "import json; d=json.load(open('gitleaks-report.json')); print(len(d) if isinstance(d,list) else 0)" 2>/dev/null || echo "?")
+            echo "status=found" >> $GITHUB_OUTPUT
+            echo "count=$COUNT" >> $GITHUB_OUTPUT
           fi
-          echo "count=$COUNT" >> $GITHUB_OUTPUT
+        continue-on-error: true
 
       # ── Comentario de resumo no PR ────────────
       - name: Comentar resultado no PR
         uses: actions/github-script@v7
         if: always()
+        env:
+          SEMGREP_OUTCOME: ${{ steps.semgrep.outcome }}
+          GITLEAKS_STATUS: ${{ steps.gitleaks.outputs.status }}
+          GITLEAKS_COUNT: ${{ steps.gitleaks.outputs.count }}
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const semgrepOk  = '${{ steps.semgrep.outcome }}'  === 'success';
-            const gitleaksOk = process.env.GITLEAKS_FOUND !== 'true';
-            const glCount    = '${{ steps.gitleaks_count.outputs.count }}' || '0';
+            const semgrepOk  = process.env.SEMGREP_OUTCOME === 'success';
+            const gitleaksOk = process.env.GITLEAKS_STATUS === 'clean';
+            const glCount    = process.env.GITLEAKS_COUNT || '0';
 
-            const icon  = (ok) => ok ? '✅' : '⚠️';
-            const badge = (ok) => ok ? '`LIMPO`' : '`ALERTAS ENCONTRADOS`';
+            const ok  = (v) => v ? 'LIMPO' : 'ALERTAS ENCONTRADOS';
+            const ico = (v) => v ? 'OK' : 'ATENCAO';
 
-            const body = [
-              '## 🔒 Security Scan — Resultado (Dry Run)',
+            const gitleaksCell = gitleaksOk
+              ? 'LIMPO'
+              : 'ALERTAS ENCONTRADOS — ' + glCount + ' secret(s) detectado(s)';
+
+            const lines = [
+              '## Security Scan — Resultado (Dry Run)',
               '',
               '> **Modo dry-run ativo:** findings nao bloqueiam o merge nesta fase de testes.',
               '',
               '| Scanner | Status | Resultado |',
               '|---------|--------|-----------|',
-              `| Semgrep SAST | ${icon(semgrepOk)} | ${badge(semgrepOk)} |`,
-              `| Gitleaks (secrets) | ${icon(gitleaksOk)} | ${gitleaksOk ? badge(true) : \`\`ALERTAS ENCONTRADOS\`\` — ${glCount} secret(s) detectado(s)} |`,
+              '| Semgrep SAST | ' + (semgrepOk ? 'OK' : 'ATENCAO') + ' | ' + ok(semgrepOk) + ' |',
+              '| Gitleaks (secrets) | ' + (gitleaksOk ? 'OK' : 'ATENCAO') + ' | ' + gitleaksCell + ' |',
               '',
-              semgrepOk && gitleaksOk
-                ? '**Codigo limpo — nenhuma vulnerabilidade encontrada.** ✅'
-                : '**⚠️ Verifique os logs do workflow para detalhes dos alertas.**',
+              (semgrepOk && gitleaksOk)
+                ? 'Codigo limpo — nenhuma vulnerabilidade encontrada.'
+                : 'ATENCAO: Verifique os logs do workflow para detalhes dos alertas.',
               '',
-              `*Executado em: ${new Date().toLocaleString('pt-BR', {timeZone: 'America/Sao_Paulo'})}*`
-            ].join('\n');
+              'Executado em: ' + new Date().toLocaleString('pt-BR', {timeZone: 'America/Sao_Paulo'})
+            ];
+
+            const body = lines.join('\n');
 
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
